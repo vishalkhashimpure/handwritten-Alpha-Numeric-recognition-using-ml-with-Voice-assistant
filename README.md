@@ -24,7 +24,7 @@ Technology Stack
 
 Programming Language: Python
 
-Frameworks and Libraries: OpenCV, TensorFlow/PyTorch, NumPy, Matplotlib, 
+Frameworks and Libraries: OpenCV, TensorFlow/PyTorch, NumPy, Matplotlib, pyttsx3,
 
 Tools: Jupyter Notebook, Google Colab
 
