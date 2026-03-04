@@ -1,0 +1,307 @@
+# save as predict_word_debug.py
+import json
+import numpy as np
+import tensorflow as tf
+from PIL import Image
+import pyttsx3
+import os
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import cv2
+import math
+
+MODEL_PATH = "char_digit_model.h5"
+LABELS_PATH = "label_map.json"
+IMG_SIZE = (64, 64)
+
+# You can tune this: predictions below this are considered low-confidence
+CONF_THRESH = 0.45
+
+# If you want to *force* classify printed too while debugging, set False:
+REQUIRE_HANDWRITTEN = True
+
+DIGIT_WORDS = {
+    "0": "zero","1": "one","2": "two","3": "three","4": "four",
+    "5": "five","6": "six","7": "seven","8": "eight","9": "nine",
+}
+
+# ---------------- helpers ----------------
+
+def load_model_and_labels():
+    if not os.path.isfile(MODEL_PATH):
+        raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
+    if not os.path.isfile(LABELS_PATH):
+        raise FileNotFoundError(f"Label map file not found: {LABELS_PATH}")
+    model = tf.keras.models.load_model(MODEL_PATH)
+    with open(LABELS_PATH, "r") as f:
+        label_map = json.load(f)
+    label_map = {int(k): v for k, v in label_map.items()}
+    return model, label_map
+
+def deskew_and_center(crop_gray, size=IMG_SIZE):
+    # deskew using image moments, pad to square, resize maintaining aspect ratio, center on white background
+    h, w = crop_gray.shape
+    # threshold to binary for moments
+    _, bw = cv2.threshold(crop_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    M = cv2.moments(bw)
+    if abs(M.get("mu02", 0)) < 1e-2:
+        angle = 0.0
+    else:
+        angle = 0.5 * math.degrees(math.atan2(2 * M.get("mu11", 0), (M.get("mu20", 0) - M.get("mu02", 0) + 1e-8)))
+
+    # rotate around center
+    center = (w // 2, h // 2)
+    rot = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(crop_gray, rot, (w, h), flags=cv2.INTER_LINEAR, borderValue=255)
+
+    # pad to square with margin
+    mh = max(rotated.shape)
+    pad_vert = max(0, mh - rotated.shape[0])
+    pad_horz = max(0, mh - rotated.shape[1])
+    top = pad_vert // 2
+    bottom = pad_vert - top
+    left = pad_horz // 2
+    right = pad_horz - left
+    squared = cv2.copyMakeBorder(rotated, top+8, bottom+8, left+8, right+8, cv2.BORDER_CONSTANT, value=255)
+
+    # resize with aspect keep
+    pil = Image.fromarray(squared)
+    pil = pil.resize(size, Image.LANCZOS)
+    arr = np.array(pil).astype("float32") / 255.0
+    # invert if background is white -> keep strokes bright (model expects this)
+    if arr.mean() > 0.5:
+        arr = 1.0 - arr
+    arr = np.expand_dims(arr, axis=-1)
+    arr = np.expand_dims(arr, axis=0)
+    return arr
+
+def predict_top_k(model, arr, k=3):
+    preds = model.predict(arr)[0]
+    idxs = np.argsort(preds)[::-1][:k]
+    return [(int(i), float(preds[i])) for i in idxs]
+
+# ----- segmentation helpers: merge horizontally overlapping boxes -----
+def merge_boxes_horiz(boxes, max_gap=10, overlap_thresh=0.15):
+    """
+    boxes: list of (x,y,w,h)
+    merges boxes that overlap significantly horizontally or are very close.
+    """
+    if not boxes:
+        return []
+    boxes = sorted(boxes, key=lambda b: b[0])
+    merged = []
+    cur = list(boxes[0])
+    for x,y,w,h in boxes[1:]:
+        cx, cy, cw, ch = cur
+        # compute gap between boxes
+        gap = x - (cx + cw)
+        # compute horizontal overlap fraction if any
+        inter_left = max(cx, x)
+        inter_right = min(cx+cw, x+cw)
+        overlap = max(0, inter_right - inter_left)
+        overlap_frac = overlap / max(cw, cw + 1e-8)
+        if gap <= max_gap or overlap_frac > overlap_thresh:
+            # merge
+            nx = min(cx, x)
+            ny = min(cy, y)
+            nright = max(cx+cw, x+cw)
+            nbottom = max(cy+ch, y+ch)
+            cur = [nx, ny, nright-nx, nbottom-ny]
+        else:
+            merged.append(tuple(cur))
+            cur = [x,y,w,h]
+    merged.append(tuple(cur))
+    return merged
+
+# ---------- segmentation pipeline ----------
+def segment_characters(image_path, debug=False):
+    img = cv2.imread(image_path)
+    if img is None:
+        raise FileNotFoundError(f"Could not read image: {image_path}")
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    h_img, w_img = gray.shape
+
+    # larger blur to reduce texture noise
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
+
+    # Try adaptive threshold and then morphological closing, then find contours
+    th = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY_INV, 31, 9)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+    closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    for cnt in contours:
+        x,y,w,h = cv2.boundingRect(cnt)
+        if w < 6 or h < 6:
+            continue
+        if h < 0.03 * h_img or w < 0.03 * w_img:
+            continue
+        boxes.append((x,y,w,h))
+
+    # Merge boxes that belong to the same character (prevents splits)
+    boxes = merge_boxes_horiz(boxes, max_gap=int(0.06*w_img), overlap_thresh=0.12)
+
+    # sort left to right
+    boxes_sorted = sorted(boxes, key=lambda b: b[0])
+
+    # return crops with coordinates
+    crops = []
+    for (x,y,w,h) in boxes_sorted:
+        pad_x = max(2, int(0.05*w))
+        pad_y = max(2, int(0.06*h))
+        x0 = max(0, x-pad_x); y0 = max(0, y-pad_y)
+        x1 = min(w_img, x+w+pad_x); y1 = min(h_img, y+h+pad_y)
+        crop = gray[y0:y1, x0:x1]
+        crops.append((x0,y0,x1-x0,y1-y0,crop))
+    return crops, img
+
+# ---------- handwriting heuristic (optional) ----------
+def is_handwritten_simple(crop_gray):
+    # simple heuristic: stroke width variation + laplacian variance
+    h,w = crop_gray.shape
+    if h < 8 or w < 8:
+        return False
+    _, bw = cv2.threshold(crop_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    if np.count_nonzero(bw) < 10:
+        return False
+    dist = cv2.distanceTransform(bw, cv2.DIST_L2, 5)
+    stroke_pixels = dist[dist>0]
+    if stroke_pixels.size == 0:
+        return False
+    sw_mean = float(np.mean(stroke_pixels))*2.0
+    sw_std = float(np.std(stroke_pixels))*2.0
+    sw_ratio = sw_std / (sw_mean + 1e-8)
+    lap_var = float(cv2.Laplacian(crop_gray, cv2.CV_64F).var())
+    # heuristics: handwriting -> higher sw_ratio and lower lap_var
+    if sw_ratio > 0.16 and lap_var < 170:
+        return True
+    if sw_ratio > 0.22:
+        return True
+    return False
+
+# ---------- main prediction for whole image ----------
+def predict_word_from_image(model, label_map, image_path, debug=True):
+    crops, orig_img = segment_characters(image_path, debug=debug)
+    if not crops:
+        raise RuntimeError("No characters detected.")
+
+    word_chars = []
+    confidences = []
+    debug_items = []  # list of dicts for visualization and diagnosis
+    for (x,y,w,h,crop_gray) in crops:
+        is_hand = True
+        if REQUIRE_HANDWRITTEN:
+            is_hand = is_handwritten_simple(crop_gray)
+        # produce visualization data even if printed
+        arr = deskew_and_center(crop_gray, size=IMG_SIZE)
+        topk = predict_top_k(model, arr, k=3)
+        best_idx, best_conf = topk[0]
+        best_label = label_map.get(best_idx, str(best_idx))
+        alt = [(label_map.get(i,str(i)), float(conf)) for i,conf in topk]
+        if not is_hand:
+            # mark as printed-like
+            debug_items.append({"box":(x,y,w,h), "label":best_label, "conf":best_conf, "printed":True, "alts":alt})
+            continue
+        # if confidence low mark as '?'
+        if best_conf < CONF_THRESH:
+            out_label = "?"
+        else:
+            out_label = best_label
+        word_chars.append(out_label)
+        confidences.append(best_conf)
+        debug_items.append({"box":(x,y,w,h), "label":out_label, "conf":best_conf, "printed":False, "alts":alt})
+
+    # build annotated image for debugging
+    annotated = orig_img.copy()
+    for di in debug_items:
+        x,y,w,h = di["box"]
+        lbl = di["label"]
+        conf = di["conf"]
+        printed = di["printed"]
+        color = (0,255,0) if (not printed and lbl != "?") else (0,165,255) if (not printed and lbl == "?") else (0,0,255)
+        cv2.rectangle(annotated, (x,y), (x+w, y+h), color, 2)
+        text = f"{lbl} {int(conf*100)}%"
+        cv2.putText(annotated, text, (x, max(12,y-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        # optionally add alt predictions on next line
+        alt_text = ", ".join([f"{a[0]}({int(a[1]*100)}%)" for a in di["alts"][:2]])
+        cv2.putText(annotated, alt_text, (x, y+h+14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+    # save annotated image next to original
+    base, ext = os.path.splitext(image_path)
+    out_path = base + "_annotated.png"
+    cv2.imwrite(out_path, annotated)
+
+    final_word = "".join(word_chars) if word_chars else None
+    return final_word, confidences, out_path, debug_items
+
+def speak_text(phrase):
+    try:
+        engine = pyttsx3.init()
+        engine.setProperty("rate", 150)
+        engine.say(phrase)
+        engine.runAndWait()
+    except Exception as e:
+        print("TTS error:", e)
+
+# ---------- GUI ----------
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Handwritten Word Recognizer (debug)")
+
+        try:
+            self.model, self.label_map = load_model_and_labels()
+        except Exception as e:
+            messagebox.showerror("Error loading model", str(e))
+            self.root.destroy()
+            return
+
+        self.label = tk.Label(root, text="Upload an image containing a handwritten word (debug mode)",
+                              font=("Segoe UI", 12))
+        self.label.pack(pady=10)
+
+        self.button = tk.Button(root, text="Choose Image", command=self.choose_image, font=("Segoe UI", 11))
+        self.button.pack(pady=5)
+
+        self.result_label = tk.Label(root, text="", font=("Segoe UI", 12, "bold"))
+        self.result_label.pack(pady=10)
+
+    def choose_image(self):
+        filetypes = [("Image files", "*.png *.jpg *.jpeg *.bmp *.gif"), ("All files", "*.*")]
+        filename = filedialog.askopenfilename(title="Select image", filetypes=filetypes)
+        if not filename:
+            return
+        try:
+            word, confs, annotated_path, debug_items = predict_word_from_image(self.model, self.label_map, filename, debug=True)
+            if word is None:
+                messagebox.showinfo("No handwritten chars",
+                    "No handwritten characters detected or they were filtered out. Check the annotated image for diagnostics.")
+                self.result_label.config(text="No handwritten characters found.")
+                # still open annotated image
+                os.startfile(annotated_path) if os.name == "nt" else print("Annotated at:", annotated_path)
+                return
+
+            # show result and open annotated image
+            items = [f"{c}:{int(conf*100)}%" for c,conf in zip(word, confs)]
+            self.result_label.config(text=f"Predicted word: {word}   [{' '.join(items)}]")
+            speak_text(f"The predicted word is {word}.")
+            # open annotated image so user can visually inspect segmentation/predictions
+            try:
+                if os.name == "nt":
+                    os.startfile(annotated_path)
+                else:
+                    # mac / linux
+                    opener = "open" if sys.platform == "darwin" else "xdg-open"
+                    os.system(f'{opener} "{annotated_path}"')
+            except Exception:
+                print("Annotated image saved to:", annotated_path)
+
+        except Exception as e:
+            messagebox.showerror("Prediction error", str(e))
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = App(root)
+    root.mainloop()
