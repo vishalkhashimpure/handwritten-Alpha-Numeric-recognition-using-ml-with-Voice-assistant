@@ -1,0 +1,83 @@
+import tensorflow as tf
+import os
+
+# ---- FIXED PATH ----
+DATA_DIR = r"sorted_images"  # <- make sure this folder exists in your working directory
+
+IMG_SIZE = (28, 28)
+BATCH_SIZE = 32
+
+def main():
+    if not os.path.isdir(DATA_DIR):
+        raise FileNotFoundError(f"Dataset folder not found: {DATA_DIR}")
+
+    # 1. Load dataset from directory
+    train_ds = tf.keras.utils.image_dataset_from_directory(
+        DATA_DIR,
+        validation_split=0.2,
+        subset="training",
+        seed=123,
+        image_size=IMG_SIZE,
+        color_mode="grayscale",
+        batch_size=BATCH_SIZE
+    )
+
+    val_ds = tf.keras.utils.image_dataset_from_directory(
+        DATA_DIR,
+        validation_split=0.2,
+        subset="validation",
+        seed=123,
+        image_size=IMG_SIZE,
+        color_mode="grayscale",
+        batch_size=BATCH_SIZE
+    )
+
+    class_names = train_ds.class_names
+    print("Classes:", class_names)
+
+if __name__ == "__main__":
+    main()
+
+
+--------------------------------- anothere dataset ------------------------
+
+import tensorflow as tf
+import os
+
+# ---- FIXED PATH ----
+DATA_DIR = r"Digit dataset 0-9"
+  # <- make sure this folder exists in your working directory
+
+IMG_SIZE = (28, 28)
+BATCH_SIZE = 32
+
+def main():
+    if not os.path.isdir(DATA_DIR):
+        raise FileNotFoundError(f"Dataset folder not found: {DATA_DIR}")
+
+    # 1. Load dataset from directory
+    train_ds = tf.keras.utils.image_dataset_from_directory(
+        DATA_DIR,
+        validation_split=0.2,
+        subset="training",
+        seed=123,
+        image_size=IMG_SIZE,
+        color_mode="grayscale",
+        batch_size=BATCH_SIZE
+    )
+
+    val_ds = tf.keras.utils.image_dataset_from_directory(
+        DATA_DIR,
+        validation_split=0.2,
+        subset="validation",
+        seed=123,
+        image_size=IMG_SIZE,
+        color_mode="grayscale",
+        batch_size=BATCH_SIZE
+    )
+
+    class_names = train_ds.class_names
+    print("Classes:", class_names)
+
+if __name__ == "__main__":
+    main()
